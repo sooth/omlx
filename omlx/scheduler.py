@@ -191,6 +191,7 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset({
     "KVCache", "BatchKVCache", "QuantizedKVCache",
     "TurboQuantKVCache", "BatchTurboQuantKVCache",
+    "PlanarQuantKVCache", "BatchPlanarQuantKVCache",
 })
 
 
