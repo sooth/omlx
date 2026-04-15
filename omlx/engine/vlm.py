@@ -402,9 +402,16 @@ class VLMBatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
-        # TurboQuant KV cache
+        # TurboQuant / PlanarQuant KV cache (mutually exclusive)
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            pq_enabled = getattr(self._model_settings, "planarquant_kv_enabled", False)
+            if tq_enabled and pq_enabled:
+                logger.warning(
+                    "PlanarQuant3 and TurboQuant both enabled for VLM; "
+                    "disabling TurboQuant (they patch the same dispatch path)."
+                )
+                tq_enabled = False
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
@@ -414,6 +421,17 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_settings, "turboquant_skip_last", True
                 )
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+            if pq_enabled:
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                from ..patches.planarquant_cache import enable_planarquant_cache
+                apply_turboquant_attention_patch()
+                pq_bits = int(getattr(self._model_settings, "planarquant_kv_bits", 3))
+                pq_quant_v = bool(getattr(self._model_settings, "planarquant_quantize_v", True))
+                enable_planarquant_cache(bits=pq_bits, quantize_v=pq_quant_v)
+                logger.info(
+                    f"PlanarQuant3 KV cache enabled for VLM: {pq_bits}-bit, "
+                    f"quantize_v={pq_quant_v}"
+                )
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:

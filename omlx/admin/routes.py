@@ -113,6 +113,10 @@ class ModelSettingsRequest(BaseModel):
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: Optional[bool] = None
     turboquant_kv_bits: Optional[float] = None
+    # PlanarQuant3 KV cache
+    planarquant_kv_enabled: Optional[bool] = None
+    planarquant_kv_bits: Optional[int] = None
+    planarquant_quantize_v: Optional[bool] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
@@ -1375,6 +1379,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "index_cache_freq": settings.index_cache_freq,
                 "turboquant_kv_enabled": settings.turboquant_kv_enabled,
                 "turboquant_kv_bits": settings.turboquant_kv_bits,
+                "turboquant_skip_last": settings.turboquant_skip_last,
+                "planarquant_kv_enabled": settings.planarquant_kv_enabled,
+                "planarquant_kv_bits": settings.planarquant_kv_bits,
+                "planarquant_quantize_v": settings.planarquant_quantize_v,
                 "specprefill_enabled": settings.specprefill_enabled,
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
@@ -1592,6 +1600,21 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    # PlanarQuant3 KV cache settings
+    if "planarquant_kv_enabled" in sent:
+        current_settings.planarquant_kv_enabled = request.planarquant_kv_enabled or False
+    if "planarquant_kv_bits" in sent:
+        current_settings.planarquant_kv_bits = int(request.planarquant_kv_bits or 3)
+    if "planarquant_quantize_v" in sent:
+        current_settings.planarquant_quantize_v = (
+            True if request.planarquant_quantize_v is None else bool(request.planarquant_quantize_v)
+        )
+    # Mutual exclusion: PQ and TQ patch the same attention dispatch path
+    if current_settings.planarquant_kv_enabled and current_settings.turboquant_kv_enabled:
+        logger.warning(
+            "PlanarQuant3 and TurboQuant are mutually exclusive; disabling TurboQuant."
+        )
+        current_settings.turboquant_kv_enabled = False
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

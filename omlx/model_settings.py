@@ -63,6 +63,11 @@ class ModelSettings:
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
     turboquant_skip_last: bool = True  # Skip last KVCache layer (prevents corruption on sensitive models)
 
+    # PlanarQuant3 KV cache (Givens rotation + Lloyd-Max 3-bit)
+    planarquant_kv_enabled: bool = False
+    planarquant_kv_bits: int = 3  # Currently only 3 is supported
+    planarquant_quantize_v: bool = True  # True = K+V quantized, False = K only
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
