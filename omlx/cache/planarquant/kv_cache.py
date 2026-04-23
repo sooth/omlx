@@ -922,6 +922,17 @@ class PlanarQuantKVCache(_BaseCache):
             self._packed_last_k = int(vals[5]) or None
             self._packed_last_v = int(vals[6]) or None
 
+    @classmethod
+    def merge(cls, caches):
+        """Merge a list of PlanarQuantKVCache instances into a BatchPlanarQuantKVCache.
+
+        This enables PlanarQuantKVCache to work with mlx_lm's batching-with-history
+        path (_merge_caches in generate.py), which requires a ``merge`` method on
+        every cache class.
+        """
+        from .kv_cache import BatchPlanarQuantKVCache
+        return BatchPlanarQuantKVCache.merge(caches)
+
 
 # ---------------------------------------------------------------------------
 # State packing for safetensors round-trip
@@ -987,12 +998,38 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
             return create_attention_mask(*args, offset=self.offset, **kwargs)
         if create_causal_mask is None:
             return create_attention_mask(*args, offset=0, **kwargs)
-        return create_causal_mask(
-            args[0],
-            offset=self.offset,
-            left_padding=mx.array(self.left_padding),
-            **kwargs,
-        )
+
+        kwargs.pop("return_array", None)
+        N = args[0] if args else args[0]
+        return self._build_causal_mask(N, kwargs.get("window_size"))
+
+    def _build_causal_mask(self, N: int, window_size=None) -> mx.array:
+        """Build a (B, 1, N, KV) causal mask with per-sample offsets."""
+        offset = self.offset  # mx.array of shape (B,)
+        left_pad = mx.array(self.left_padding)  # shape (B,)
+        max_offset = int(offset.max().item())
+        KV = max_offset + N
+
+        # r indices: [0, ..., KV-1], shape (1, 1, KV)
+        rinds = mx.arange(KV)[None, None, :]
+        # l indices: per-sample [offset[b], ..., offset[b]+N-1], shape (B, 1, N, 1)
+        linds = mx.arange(N)[None, None, :, None]  # (1, 1, N, 1)
+
+        off = offset[:, None, None, None]  # (B, 1, 1, 1)
+        linds = linds + off  # (B, 1, N, 1)
+
+        # causal: l >= r
+        mask = linds >= rinds  # (B, 1, N, KV)
+
+        if window_size is not None:
+            mask = mask & (linds < rinds + window_size)
+
+        # left padding: r >= left_pad[b]
+        if left_pad is not None and left_pad.size > 0:
+            lp = left_pad[:, None, None, None]  # (B, 1, 1, 1)
+            mask = mask & (rinds >= lp)
+
+        return mask
 
     # ------------------------------------------------------------------
     # Batch-aware overrides for array offset
@@ -1005,11 +1042,21 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
         return self.offset
 
     def _ensure_k_dequant_cache(self) -> None:
+        """Dequantize packed K into FP16 cache, growing if needed."""
         max_off = self._max_offset()
-        if self._k_dequant_cache is not None and self._k_dequant_offset == max_off:
+        if (self._k_dequant_cache is not None
+                and self._k_dequant_offset == max_off
+                and self._k_dequant_cache.shape[2] >= max_off):
             return
         assert self._B is not None and self._H_k is not None and self._D_k is not None
-        cache = mx.zeros((self._B, self._H_k, self._cap, self._D_k), dtype=mx.float16)
+        cur_cap = self._k_dequant_cache.shape[2] if self._k_dequant_cache is not None else 0
+        if max_off > cur_cap:
+            old = self._k_dequant_cache
+            self._cap = max(self._cap, max_off)
+            new_cache = mx.zeros((self._B, self._H_k, self._cap, self._D_k), dtype=mx.float16)
+            if old is not None:
+                new_cache[..., :old.shape[2], :] = old
+            self._k_dequant_cache = new_cache
         if max_off > 0:
             assert self._k_packed is not None
             assert self._k_norms is not None
@@ -1018,24 +1065,32 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
                 self._k_norms[..., :max_off, :],
                 out_dtype=mx.float16,
             )
-            cache[..., :max_off, :] = k_dq.astype(mx.float16)
-        self._k_dequant_cache = cache
+            self._k_dequant_cache[..., :max_off, :] = k_dq.astype(mx.float16)
         self._k_dequant_offset = max_off
 
     def _ensure_v_dequant_cache(self) -> None:
+        """Dequantize packed V into FP16 cache, growing if needed."""
         max_off = self._max_offset()
-        if self._v_dequant_cache is not None and self._v_dequant_offset == max_off:
+        if (self._v_dequant_cache is not None
+                and self._v_dequant_offset == max_off
+                and self._v_dequant_cache.shape[2] >= max_off):
             return
         assert self._B is not None and self._H_v is not None and self._D_v is not None
-        cache = mx.zeros((self._B, self._H_v, self._cap, self._D_v), dtype=mx.float16)
+        cur_cap = self._v_dequant_cache.shape[2] if self._v_dequant_cache is not None else 0
+        if max_off > cur_cap:
+            old = self._v_dequant_cache
+            self._cap = max(self._cap, max_off)
+            new_cache = mx.zeros((self._B, self._H_v, self._cap, self._D_v), dtype=mx.float16)
+            if old is not None:
+                new_cache[..., :old.shape[2], :] = old
+            self._v_dequant_cache = new_cache
         if max_off > 0 and self._v_packed is not None and self._v_norms is not None:
             v_dq = dequantize_fused(
                 self._v_packed[..., :max_off, :],
                 self._v_norms[..., :max_off, :],
                 out_dtype=mx.float16,
             )
-            cache[..., :max_off, :] = v_dq.astype(mx.float16)
-        self._v_dequant_cache = cache
+            self._v_dequant_cache[..., :max_off, :] = v_dq.astype(mx.float16)
         self._v_dequant_offset = max_off
 
     def finalize_prefill(self) -> None:
@@ -1175,7 +1230,6 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
         # Quantized mode — batch variant
         self._grow_packed(new_max)
         self._ensure_k_dequant_cache()
-        self._grow_k_dequant_cache(new_max)
 
         assert self._k_dequant_cache is not None
         if isinstance(self.offset, mx.array):
@@ -1199,7 +1253,6 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
 
         if self.quantize_v:
             self._ensure_v_dequant_cache()
-            self._grow_v_dequant_cache(new_max)
             assert self._v_dequant_cache is not None
             if isinstance(self.offset, mx.array):
                 for b in range(B):
@@ -1230,8 +1283,15 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
                 FP16State(self._v_dequant_cache[..., :max_valid, :]),
             )
 
-        # Asymmetric V
+        # Asymmetric V — _v_fp16 is FP16, needs to grow beyond prefill cap
         assert self._v_fp16 is not None
+        # Grow _v_fp16 if decode extends beyond prefill cap
+        if new_max > self._v_fp16.shape[2]:
+            grow_by = max(self.cache_step, new_max - self._v_fp16.shape[2])
+            new_cap = self._v_fp16.shape[2] + grow_by
+            pad = mx.zeros((*self._v_fp16.shape[:2], new_cap - self._v_fp16.shape[2], self._v_fp16.shape[3]), dtype=mx.float16)
+            self._v_fp16 = mx.concatenate([self._v_fp16, pad], axis=2)
+            self._cap = new_cap
         if isinstance(self.offset, mx.array):
             for b in range(B):
                 off = int(self.offset[b].item())
@@ -1646,6 +1706,8 @@ class BatchPlanarQuantKVCache(PlanarQuantKVCache):
     def decode_attention(
         self,
         queries: mx.array,
+        keys_state=None,
+        values_state=None,
         scale: float = 1.0,
         mask: mx.array | None = None,
     ) -> mx.array:
